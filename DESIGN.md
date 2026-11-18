@@ -1,73 +1,123 @@
 # DESIGN
 
-## What it is
-A terminal chat agent (TypeScript/Node) with **one tool: web search**, and a persistent, **dated** memory of every past conversation. Run: `npm install && cp .env.example .env && npm run dev`.
+A terminal chat agent (TypeScript on Node) with **one tool: web search**, plus a **persistent, dated memory** of every past conversation.
 
-## Key insight
-The sample questions ("Has any of them changed pricing *since Monday*?", "What did I ask on 3 November, is it still correct?", "Last Tuesday I asked about Postgres hosting...") are not really search problems. They are **time + memory** problems that end in a search. Three things must be right, in order: (1) know what today is, (2) know what was said on the referenced day, (3) re-verify against the live web and report the delta. Most "chat + search" agents only do (3).
+```bash
+npm install
+cp .env.example .env      # set OPENAI_API_KEY (the only required key)
+npm run dev
+```
 
-index.ts
-  └─► agent.turn(input, hooks)
-        │
-        ├─ 1. now = new Date()
-        │
-        ├─ 2. memory.renderPast(sessionId, now, tz, budget)
-        │       → string: dated transcript of OLD sessions
-        │
-        ├─ 3. buildSystem(now, tz, thatString, maxSearches)
-        │       └─ calendarBlock(now, tz)  → "last Monday = 16 November…"
-        │       → big instructions string
-        │
-        ├─ 4. input = [ this session's earlier messages…, your new message ]
-        │
-        ├─ 5. client.responses.create({ instructions, input,
-        │        tools:[web_search], stream:true })
-        │       │
-        │       │   OpenAI runs the searches itself, streams events back:
-        │       ├─ output_text.delta     → hooks.onText()   (prints words live)
-        │       ├─ output_item.done      → hooks.onSearch() (prints [searching: …])
-        │       └─ response.completed    → keep the final response object
-        │
-        ├─ 6. read url_citation annotations from the final response → sources
-        │
-        ├─ 7. memory.append(session, userMsg, assistantMsg)
-        │       → writes data/memory.json  (only now!)
-        │
-        └─ 8. return { text, sources }  → index.ts prints the "Sources:" list
+## 1. The key insight
 
+The sample questions are not really search problems:
 
+- "On Monday we shortlisted 5 CRM tools. Has any of them changed pricing since?"
+- "What did I ask you on 3 November? Is your answer still correct today?"
+- "Last Tuesday I asked about Postgres hosting. Has any pricing changed since?"
 
-1. **System prompt rebuilt every turn**: current time, a code-generated calendar ("last Tuesday = 17 Nov 2026"), and a dated transcript of earlier conversations (incl. URLs used).
-2. The model resolves references against that table, finds the original exchange, and follows an explicit *re-verification procedure* (extract items -> search each separately, primary sources first -> report CHANGED / NO CHANGE FOUND / COULD NOT VERIFY).
-3. If the record has nothing for that date it must say so rather than invent a shortlist.
-4. Answers stream; cited sources are printed; the turn is saved only on success (atomic write-then-rename).
+They are **time and memory problems that end in a search**. Three things must be right, in this order:
 
-## Why this way
-- **Calendar in code, not in the model.** LLMs are unreliable at "last Tuesday". A lookup table removes that failure class. Unit-tested (`npm test`), including timezone edge cases.
-- **Memory is injected, not a tool.** The brief says one tool. Also, an agent that must *decide* to call a recall tool can forget to; always-in-context memory can't. Cost is tokens, capped by `MEMORY_CHAR_BUDGET` (newest kept).
-- **Store URLs with each answer.** "Is your answer still correct?" needs the baseline claim, its date and where it came from.
-- **Provider-hosted search (OpenAI Responses API `web_search`).** One key, one streaming request, the model decides when/what to search, and every claim comes back with `url_citation` annotations we store as sources. No scraping or ranking code to maintain. We strip the `utm_source=openai` tracking param so URLs are clean and dedupe.
-- **JSON file store.** Zero setup, inspectable, atomic. Fits `npm install && npm run dev`.
-- **Text-only replay inside a session.** Drops bulky tool blocks between turns; sources kept as URLs.
-- **Honesty rules in the prompt**: "no change found" is not "no change"; the earlier answer may itself have been wrong; prices must state basis (per seat, billing period) and source date.
+1. **Know what today is**, and what "Monday" or "last Tuesday" means.
+2. **Know what was said on that day**, including what the agent answered.
+3. **Re-check the live web** and report what changed.
 
-## Considered and rejected
-- **Tavily/Serper + own tool loop**: more control over ranking and fetching, but a second key, more code, worse citations. Worth it only if search quality proves to be the bottleneck.
-- **Vector DB / embeddings for memory**: overkill for one user; retrieval misses are exactly the failure ("what did I ask on 3 Nov") that a full dated transcript avoids.
-- **Memory-recall tool**: see above; also violates the one-tool constraint.
-- **LangChain/LangGraph**: abstraction with no benefit for a single loop; harder to explain every line.
-- **Web UI**: not needed to evaluate behavior; time went to correctness.
+Most "chat + search" agents only do step 3. This one is built around steps 1 and 2.
 
-## Known limits
-- Whole-history-in-context won't scale past a few hundred conversations (oldest are dropped with a visible note).
-- Single user, single device. Sessions are per process start or `/new`.
-- Date understanding covers weekday/day-month forms; "the week before Diwali" would rely on model judgment.
-- Provider search can't be tuned (domains, freshness) per query in this setup.
+## 2. How it works
 
-## With another week
-1. **Eval harness**: scripted multi-day transcripts (fake clock + seeded memory) for the three sample question types, graded on correct baseline retrieval and delta accuracy.
-2. **Hierarchical memory**: per-conversation summaries + structured "claims ledger" (entity, claim, date, source) so follow-ups diff against structured facts, and long histories scale.
-3. **Scheduled watch**: user says "watch these 5"; nightly job re-checks and stores diffs, so "what changed?" is answered from a log plus a fresh search.
-4. **Prompt-cache-friendly ordering** (static instructions first, memory next, volatile calendar last) so OpenAI's automatic caching cuts cost; higher reasoning effort for multi-entity comparisons.
-5. **Search upgrades**: domain allow-lists for pricing pages, direct fetch of pricing/changelog URLs, snapshot hashes for change detection.
-6. **Web/Slack front-end**, per-user auth, encrypted storage.
+```
+you ──► index.ts (terminal)
+          │
+          ▼
+     agent.turn()
+          │
+          ├─ 1. now = current time
+          ├─ 2. memory.renderPast()   → dated transcript of earlier conversations
+          ├─ 3. buildSystem()         → date + calendar + transcript + rules
+          ├─ 4. input = this session's messages + your new message
+          ├─ 5. OpenAI Responses API, tools: [web_search], stream: true
+          │        ├─ text deltas      → printed live
+          │        ├─ web_search_call  → "[searching: …]" shown
+          │        └─ completed        → final response kept
+          ├─ 6. read url_citation annotations → sources
+          ├─ 7. memory.append()       → saved to data/memory.json (only on success)
+          └─ 8. print answer + numbered source list
+```
+
+| File | Responsibility |
+|---|---|
+| `index.ts` | Terminal loop and commands (`/new`, `/forget`, `/exit`) |
+| `agent.ts` | One turn: build prompt, call OpenAI, collect sources, save |
+| `prompt.ts` | `buildSystem()`: the instructions the model reads each turn |
+| `dates.ts` | Timezone-aware calendar and date formatting |
+| `memory.ts` | `memory.json`: save messages, render old ones as text |
+
+### The prompt (rebuilt every turn)
+
+1. **Time and calendar.** Current time in the user's timezone, the most recent occurrence of each weekday, and the last 28 days, generated by code ("last Tuesday = Tuesday 17 November 2026, yesterday").
+2. **Memory.** A transcript of earlier conversations, each message timestamped and each answer followed by the URLs it used.
+3. **Rules.** How to resolve dates, how to answer questions about the past, and how to handle "has anything changed?" (below).
+
+### The re-verification procedure
+
+For "has anything changed since…?" or "is your answer still correct?":
+
+1. Find the original exchange in memory; extract the items, claims, and the date.
+2. Search **each item separately**, official pricing pages and changelogs first, then reputable news.
+3. Report per item: **CHANGED** (old → new), **NO CHANGE FOUND**, or **COULD NOT VERIFY**.
+4. If the earlier answer was itself wrong, say so.
+
+If memory has nothing for the date or topic the user mentions, the agent **says so** instead of inventing a shortlist.
+
+### Storage
+
+`data/memory.json` holds sessions; each session holds messages with ISO timestamps, and assistant messages also keep their source URLs.
+
+```json
+{ "version": 1,
+  "sessions": [{ "id": "…", "startedAt": "2026-11-16T08:33:00Z",
+    "messages": [
+      { "role": "user", "text": "Shortlist 5 CRMs…", "at": "2026-11-16T08:33:10Z" },
+      { "role": "assistant", "text": "HubSpot, Pipedrive…", "at": "…",
+        "sources": [{ "url": "https://www.hubspot.com/pricing" }] } ] }] }
+```
+
+Writes go to a temp file and are then renamed over the real file, so a crash cannot corrupt history. A turn is saved **only after it succeeds**, so a failed request never leaves a question with no answer.
+
+## 3. Why it is built this way
+
+- **Calendar in code, not in the model.** LLMs are unreliable at "last Tuesday". A lookup table removes that failure. It is unit-tested (`npm test`), including timezone edge cases.
+- **Memory is injected into the prompt, not a tool.** The brief allows one tool. Also, a recall tool can be forgotten; text already in the prompt cannot. The cost is tokens, capped by `MEMORY_CHAR_BUDGET` (newest conversations kept).
+- **Sources are stored with each answer.** "Is your answer still correct?" needs the old claim, its date, and where it came from.
+- **Provider-hosted search** (OpenAI Responses API `web_search`). One key, one streaming request, citations returned as `url_citation` annotations, no scraping or ranking code to maintain. The `utm_source=openai` parameter is stripped so URLs are clean and deduplicate.
+- **JSON file store.** No setup, human-readable, fits `npm install && npm run dev`.
+- **Text-only replay within a session.** Earlier search calls are dropped between turns to keep context small; sources survive as URLs.
+- **Honesty rules in the prompt.** "No change found" is not "no change"; state price basis (per seat, billing period) and source date.
+- **Callbacks (`Hooks`) for output.** `agent.ts` has no terminal code, so a web UI could reuse it unchanged.
+
+## 4. Considered and rejected
+
+| Option | Why not |
+|---|---|
+| Tavily/Serper + own tool loop | More control over ranking, but a second key, more code, weaker citations. Worth it only if search quality becomes the bottleneck. |
+| Vector DB / embeddings for memory | Overkill for one user; retrieval misses are exactly the failure ("what did I ask on 3 Nov") that a full dated transcript avoids. |
+| A memory-recall tool | Can be forgotten, and breaks the one-tool constraint. |
+| LangChain / LangGraph | Abstraction with no benefit for a single loop; harder to explain every line. |
+| Web UI | Not needed to judge behavior; time went to correctness. |
+
+## 5. Known limits
+
+- The whole history is placed in context; it will not scale past a few hundred conversations (oldest are dropped, with a visible note).
+- Single user, single device. A session is one program run, or the stretch between `/new` commands.
+- Date handling covers weekday and day-month forms; something like "the week before Diwali" relies on model judgment.
+- Hosted search cannot be tuned per query (domains, freshness).
+
+## 6. With another week
+
+1. **Eval harness.** Scripted multi-day transcripts (fake clock, seeded memory) for the three question types, graded on correct baseline retrieval and delta accuracy.
+2. **Hierarchical memory.** Per-conversation summaries plus a structured claims ledger (entity, claim, date, source), so follow-ups compare against structured facts and long histories scale.
+3. **Scheduled watch.** "Watch these 5": a nightly job re-checks and stores diffs, so "what changed?" is answered from a log plus a fresh search.
+4. **Cost and quality.** Prompt-cache-friendly ordering (static instructions, then memory, then the volatile calendar) and higher reasoning effort for multi-item comparisons.
+5. **Search upgrades.** Domain allow-lists, direct fetch of pricing and changelog pages, snapshot hashes for change detection.
+6. **Front-end and safety.** Web or Slack interface, per-user auth, encrypted storage.
